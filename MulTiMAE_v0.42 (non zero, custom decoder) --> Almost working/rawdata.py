@@ -1,4 +1,5 @@
 import os
+import numpy as np
 import pandas as pd
 import holidays
 
@@ -80,6 +81,14 @@ class Preprocess():
         data["dow"] = data["t_dat"].dt.dayofweek
         data["month"] = data["t_dat"].dt.month
         data["year"] = data["t_dat"].dt.year / data["t_dat"].dt.year.max()
+
+        # Cyclic transformation
+        def append_cyclic(col, cycle):
+            data[f"{col}_sin"] = np.sin(2 * np.pi * data[col]/cycle)
+            data[f"{col}_cos"] = np.cos(2 * np.pi * data[col]/cycle)
+        append_cyclic("day", 365)
+        append_cyclic("dow", 7)
+        append_cyclic("month", 12)
         return data
     
     def _generate_time_idx(self, data):

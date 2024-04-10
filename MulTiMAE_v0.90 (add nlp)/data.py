@@ -2,11 +2,15 @@ import numpy as np
 from sklearn.base import BaseEstimator, TransformerMixin
 
 import torch
+from transformers import ViTModel, AutoImageProcessor, BertModel, AutoTokenizer
+from PIL import Image
 
 class Dataset(torch.utils.data.Dataset):
-    def __init__(self, data, data_info, remain_rto, is_non_zero):
+    def __init__(self, data, data_info, remain_rto):
         super().__init__()
-        self.data_info, self.remain_rto, self.is_non_zero = data_info, remain_rto, is_non_zero
+        self.data_info, self.remain_rto = data_info, remain_rto
+        self.transform = AutoImageProcessor.from_pretrained("google/vit-base-patch16-224-in21k")
+        self.tokenizer = AutoTokenizer.from_pretrained("google-bert/bert-base-uncased")
         
         # Fit label encoder
         self.label_encoder_dict = self._fit_label_encoder(data)
@@ -40,11 +44,42 @@ class Dataset(torch.utils.data.Dataset):
         for col, scaler in self.data_info.processing_info["scaling_cols"].items():
             scaler = scaler()
             result_dict[col] = scaler.fit_transform(data[col].values.reshape(-1,1))
+            result_dict[f"{col}_scaler"] = scaler
         return result_dict
 
-    def _apply_remain(self, data, valid_idx, remain_rto):
-        num_remain = int(len(valid_idx) * remain_rto)
-        noise = np.random.rand(len(valid_idx))
+    def _apply_remain(self, data, mode):
+        result_dict = {}
+        target_cols = self.data_info.modality_info[mode]
+        remain_rto = self.remain_rto[mode]
+
+        for col in target_cols:
+            num_remain = int(data[col].shape[0] * remain_rto)
+            noise = np.random.rand(data[col].shape[0])
+            shuffle_idx = np.argsort(noise, axis=0)
+
+            remain_idx = shuffle_idx[:num_remain]
+            masked_idx = shuffle_idx[num_remain:]
+            revert_idx = np.argsort(shuffle_idx, axis=0)
+
+            remain_padding_mask = np.ones(remain_idx.shape)
+            masked_padding_mask = np.ones(masked_idx.shape)
+            revert_padding_mask = np.ones(revert_idx.shape)
+
+            result_dict[f"{col}_remain_idx"] = remain_idx
+            result_dict[f"{col}_masked_idx"] = masked_idx
+            result_dict[f"{col}_revert_idx"] = revert_idx
+            result_dict[f"{col}_remain_padding_mask"] = remain_padding_mask
+            result_dict[f"{col}_masked_padding_mask"] = masked_padding_mask
+            result_dict[f"{col}_revert_padding_mask"] = revert_padding_mask
+
+        return result_dict
+
+    def _apply_nlp_remain(self, col, token):
+        result_dict = {}
+        remain_rto = self.remain_rto["nlp"]
+
+        num_remain = int(token.shape[0]-1 * remain_rto)
+        noise = np.random.rand(token.shape[0]-1)
         shuffle_idx = np.argsort(noise, axis=0)
 
         remain_idx = shuffle_idx[:num_remain]
@@ -55,42 +90,15 @@ class Dataset(torch.utils.data.Dataset):
         masked_padding_mask = np.ones(masked_idx.shape)
         revert_padding_mask = np.ones(revert_idx.shape)
 
-        return remain_idx, masked_idx, revert_idx, remain_padding_mask, masked_padding_mask, revert_padding_mask
-
-    def _apply_target_remain(self, data):
-        result_dict = {}
-        target_cols = self.data_info.modality_info["target"]
-
-        for col in target_cols:
-            value = data[col].values
-
-            valid_idx = np.arange(len(value)) if not self.is_non_zero else np.where(value > 0)[0]
-            remain_idx, masked_idx, revert_idx, remain_padding_mask, masked_padding_mask, revert_padding_mask = self._apply_remain(value, valid_idx, self.remain_rto["target"])
-
-            result_dict[f"target_valid_idx"] = valid_idx
-            result_dict[f"{col}_remain_idx"] = remain_idx
-            result_dict[f"{col}_masked_idx"] = masked_idx
-            result_dict[f"{col}_revert_idx"] = revert_idx
-            result_dict[f"target_remain_padding_mask"] = remain_padding_mask
-            result_dict[f"target_masked_padding_mask"] = masked_padding_mask
-            result_dict[f"target_revert_padding_mask"] = revert_padding_mask
+        result_dict[f"{col}_remain_idx"] = remain_idx
+        result_dict[f"{col}_masked_idx"] = masked_idx
+        result_dict[f"{col}_revert_idx"] = revert_idx
+        result_dict[f"{col}_remain_padding_mask"] = remain_padding_mask
+        result_dict[f"{col}_masked_padding_mask"] = masked_padding_mask
+        result_dict[f"{col}_revert_padding_mask"] = revert_padding_mask
 
         return result_dict
-
-    def _apply_temporal_remain(self, data, valid_idx):
-        result_dict = {}
-        target_cols = self.data_info.modality_info["temporal"]
-
-        for col in target_cols:
-            value = data[col].values
-            remain_idx, masked_idx, revert_idx, _, _, _ = self._apply_remain(data[col].values, valid_idx, self.remain_rto["target"])
-
-            result_dict[f"{col}_remain_idx"] = remain_idx
-            result_dict[f"{col}_masked_idx"] = masked_idx
-            result_dict[f"{col}_revert_idx"] = revert_idx
-
-        return result_dict
-
+    
     def __getitem__(self, idx):
         result_dict = {}
         data = self.data_li[idx]
@@ -102,44 +110,62 @@ class Dataset(torch.utils.data.Dataset):
         result_dict.update(self._scale_data(data))
 
         # Masking
-        result_dict.update(self._apply_target_remain(data))
-        result_dict.update(self._apply_temporal_remain(data, result_dict["target_valid_idx"]))
+        result_dict.update(self._apply_remain(data, "target"))
+        result_dict.update(self._apply_remain(data, "temporal"))
+
+        # Img
+        img_cols = self.data_info.modality_info["img"]
+        for col in img_cols:
+            img_path = data[col].values[0]
+            img_raw = Image.open(img_path).convert("RGB")
+            result_dict[f"{col}_raw"] = img_raw
+            result_dict[col] = self.transform(img_raw, return_tensors="pt")["pixel_values"].squeeze(0)
+
+        # Nlp
+        nlp_cols = self.data_info.modality_info["nlp"]
+        for col in nlp_cols:
+            nlp_raw = data[col].values[0]
+            
+            token = self.tokenizer(nlp_raw, return_tensors="pt")["input_ids"].squeeze().numpy()
+
+            result_dict[f"{col}_raw"] = nlp_raw
+            result_dict[col] = token
+
+            # result_dict.update(self._apply_nlp_remain(col, token))
 
         return result_dict
 
 def collate_fn(batch_li, data_info):
     result_dict = {}
-    for col in data_info.modality_info["target"]:
-        tensor_type = torch.int if col in data_info.processing_info["embedding_cols"] else torch.float
-        data = [torch.from_numpy(batch[col]).to(tensor_type) for batch in batch_li]
-        data_valid_idx = [torch.from_numpy(batch[f"target_valid_idx"]).to(torch.int64) for batch in batch_li]
-        data_remain_idx = [torch.from_numpy(batch[f"{col}_remain_idx"]).to(torch.int64) for batch in batch_li]
-        data_masked_idx = [torch.from_numpy(batch[f"{col}_masked_idx"]).to(torch.int64) for batch in batch_li]
-        data_revert_idx = [torch.from_numpy(batch[f"{col}_revert_idx"]).to(torch.int64) for batch in batch_li]
-        data_remain_padding_mask = [torch.from_numpy(batch[f"target_remain_padding_mask"]).to(tensor_type) for batch in batch_li]
-        data_masked_padding_mask = [torch.from_numpy(batch[f"target_masked_padding_mask"]).to(tensor_type) for batch in batch_li]
-        data_revert_padding_mask = [torch.from_numpy(batch[f"target_revert_padding_mask"]).to(tensor_type) for batch in batch_li]
-
-        result_dict[col] = torch.nn.utils.rnn.pad_sequence(data, batch_first=True)
-        result_dict[f"target_valid_idx"] = torch.nn.utils.rnn.pad_sequence(data_valid_idx, batch_first=True)
-        result_dict[f"{col}_remain_idx"] = torch.nn.utils.rnn.pad_sequence(data_remain_idx, batch_first=True)
-        result_dict[f"{col}_masked_idx"] = torch.nn.utils.rnn.pad_sequence(data_masked_idx, batch_first=True)
-        result_dict[f"{col}_revert_idx"] = torch.nn.utils.rnn.pad_sequence(data_revert_idx, batch_first=True)
-        result_dict[f"target_remain_padding_mask"] = torch.nn.utils.rnn.pad_sequence(data_remain_padding_mask, batch_first=True)
-        result_dict[f"target_masked_padding_mask"] = torch.nn.utils.rnn.pad_sequence(data_masked_padding_mask, batch_first=True)
-        result_dict[f"target_revert_padding_mask"] = torch.nn.utils.rnn.pad_sequence(data_revert_padding_mask, batch_first=True)
-
-    for col in  data_info.modality_info["temporal"]:
+    # for col in data_info.modality_info["target"] + data_info.modality_info["temporal"] + data_info.modality_info["nlp"]:
+    for col in data_info.modality_info["target"] + data_info.modality_info["temporal"]:
         tensor_type = torch.int if col in data_info.processing_info["embedding_cols"] else torch.float
         data = [torch.from_numpy(batch[col]).to(tensor_type) for batch in batch_li]
         data_remain_idx = [torch.from_numpy(batch[f"{col}_remain_idx"]).to(torch.int64) for batch in batch_li]
         data_masked_idx = [torch.from_numpy(batch[f"{col}_masked_idx"]).to(torch.int64) for batch in batch_li]
         data_revert_idx = [torch.from_numpy(batch[f"{col}_revert_idx"]).to(torch.int64) for batch in batch_li]
+        data_remain_padding_mask = [torch.from_numpy(batch[f"{col}_remain_padding_mask"]).to(tensor_type) for batch in batch_li]
+        data_masked_padding_mask = [torch.from_numpy(batch[f"{col}_masked_padding_mask"]).to(tensor_type) for batch in batch_li]
+        data_revert_padding_mask = [torch.from_numpy(batch[f"{col}_revert_padding_mask"]).to(tensor_type) for batch in batch_li]
 
         result_dict[col] = torch.nn.utils.rnn.pad_sequence(data, batch_first=True)
         result_dict[f"{col}_remain_idx"] = torch.nn.utils.rnn.pad_sequence(data_remain_idx, batch_first=True)
         result_dict[f"{col}_masked_idx"] = torch.nn.utils.rnn.pad_sequence(data_masked_idx, batch_first=True)
         result_dict[f"{col}_revert_idx"] = torch.nn.utils.rnn.pad_sequence(data_revert_idx, batch_first=True)
+        result_dict[f"{col}_remain_padding_mask"] = torch.nn.utils.rnn.pad_sequence(data_remain_padding_mask, batch_first=True)
+        result_dict[f"{col}_masked_padding_mask"] = torch.nn.utils.rnn.pad_sequence(data_masked_padding_mask, batch_first=True)
+        result_dict[f"{col}_revert_padding_mask"] = torch.nn.utils.rnn.pad_sequence(data_revert_padding_mask, batch_first=True)
+
+    for col in data_info.processing_info["scaling_cols"]:
+        result_dict[f"{col}_scaler"] = [batch[f"{col}_scaler"] for batch in batch_li]
+    
+    for col in data_info.modality_info["img"]:
+        result_dict[col] = torch.stack([batch[col] for batch in batch_li])
+        result_dict[f"{col}_raw"] = [batch[f"{col}_raw"] for batch in batch_li]
+    
+    for col in data_info.modality_info["nlp"]:
+        result_dict[col] = [torch.from_numpy(batch[col]) for batch in batch_li]
+        result_dict[f"{col}_raw"] = [batch[f"{col}_raw"] for batch in batch_li]
 
     return result_dict
 
@@ -197,7 +223,7 @@ class CustomLabelEncoder(BaseEstimator, TransformerMixin):
         return np.array(result)
     
     def get_num_cls(self):
-        return len(self.mapper)
+        return len(self.mapper) + 1
 
 class LogScaler(BaseEstimator, TransformerMixin):
     def fit(self, x, y=None):
